@@ -1,0 +1,47 @@
+id: a1b2c3d4-1003-4000-a000-000000000003
+name: Igel - Outbound Connection to Non-Standard Port
+description: |
+  Detects established outbound TCP connections on ports outside the expected set
+  for a constrained IoT device.  IoT firmware typically connects only to a small
+  set of cloud endpoints (MQTT 8883, HTTPS 443, NTP 123).  Outbound connections
+  on high or unusual ports may indicate C2 beaconing, data exfiltration, or
+  tunneling activity.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CommandAndControl
+relevantTechniques:
+  - T1071
+  - T1571
+  - T1095
+query: |
+  let allowed_ports = dynamic([53, 123, 443, 8883]);
+  Igel_CL
+  | where kind == "connections"
+  | where state == "ESTABLISHED"
+  | where remote_port !in (allowed_ports)
+  | where remote_addr !startswith "127."
+  | where remote_addr != "0.0.0.0" and remote_addr != "::"
+  | project TimeGenerated, device, protocol, local_addr, local_port,
+            remote_addr, remote_port, state, pid, process_name
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName
+  - entityType: IP
+    fieldMappings:
+      - identifier: Address
+        columnName: remote_addr
+  - entityType: Process
+    fieldMappings:
+      - identifier: ProcessId
+        columnName: pid

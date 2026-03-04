@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // ── Self-Protection ──────────────────────────────────────────────────────
-    self_protect::secure_igel_process();
+    self_protect::harden_process();
 
     let config_path = env::args().nth(1).unwrap_or_else(|| "igel.toml".to_string());
     let cfg = config::Config::load(&config_path)?;
@@ -62,38 +62,78 @@ async fn main() -> anyhow::Result<()> {
     let mut tick_hb = interval(Duration::from_secs(cfg.heartbeat_interval));
     let mut fim_rx = collect::start_fim_monitor(cfg.fim_paths.clone());
 
-    // ── Sink ─────────────────────────────────────────────────
-    #[cfg(feature = "mqtt")]
-    let sink_instance: Box<dyn Sink> = if let Some(ref host) = cfg.mqtt_host {
-        tracing::info!(host = %host, "using MQTT sink");
-        Box::new(sink::MqttSink::new(
-            host.clone(),
-            cfg.device_id.clone(),
-            cfg.mqtt_sas_token.clone(),
-        ))
-    } else {
-        Box::new(StdoutSink)
+    // ── Sink (MQTT takes priority over HTTP; both fall back to stdout) ──
+    let sink_instance: Box<dyn Sink> = {
+        #[allow(unused_mut)]
+        let mut sink: Option<Box<dyn Sink>> = None;
+
+        #[cfg(feature = "mqtt")]
+        if sink.is_none() {
+            if let Some(ref host) = cfg.mqtt_host {
+                match sink::MqttSink::new(
+                    host.clone(),
+                    cfg.device_id.clone(),
+                    cfg.mqtt_sas_token.clone(),
+                ) {
+                    Ok(s) => {
+                        tracing::info!(host = %host, "using MQTT sink");
+                        sink = Some(Box::new(s));
+                    }
+                    Err(e) => {
+                        tracing::error!("MQTT sink init failed, falling back: {e}");
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "http")]
+        if sink.is_none() {
+            if let Some(ref url) = cfg.http_url {
+                tracing::info!(url = %url, "using HTTP sink");
+                sink = Some(Box::new(HttpSink::new(
+                    url.clone(),
+                    cfg.http_auth_token.clone(),
+                    cfg.buffer_path.clone(),
+                )));
+            }
+        }
+
+        sink.unwrap_or_else(|| Box::new(StdoutSink))
     };
 
-    #[cfg(feature = "http")]
-    let sink_instance: Box<dyn Sink> = if let Some(ref url) = cfg.http_url {
-        tracing::info!(url = %url, "using HTTP sink");
-        Box::new(HttpSink::new(
-            url.clone(),
-            cfg.http_auth_token.clone(),
-            cfg.buffer_path.clone(),
-        ))
-    } else {
-        Box::new(StdoutSink)
-    };
-
-    #[cfg(not(any(feature = "http", feature = "mqtt")))]
-    let sink_instance: Box<dyn Sink> = Box::new(StdoutSink);
+    // ── Filesystem Sandbox (Landlock) ────────────────────────────────────────
+    {
+        let mut write_dirs: Vec<String> = Vec::new();
+        if let Some(ref bp) = cfg.buffer_path {
+            if let Some(parent) = std::path::Path::new(bp).parent() {
+                let p = parent.to_string_lossy().to_string();
+                if !p.is_empty() {
+                    write_dirs.push(p);
+                }
+            }
+        }
+        self_protect::sandbox_filesystem(&cfg.fim_paths, &write_dirs);
+    }
 
     let mut events_sent: u64 = 0;
 
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+
     loop {
         tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(e) = result {
+                    tracing::error!("signal handler error: {e}");
+                }
+                tracing::info!("shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("shutting down");
+                break;
+            }
             _ = tick_proc.tick() => {
                 sys.refresh_all();
                 let ev = collect::collect_processes(&sys);
@@ -109,13 +149,23 @@ async fn main() -> anyhow::Result<()> {
                 events_sent += 1;
             }
             _ = tick_conn.tick() => {
-                let ev = collect::collect_connections();
+                let ev = tokio::task::spawn_blocking(collect::collect_connections)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("connection scan failed: {e}");
+                        Vec::new()
+                    });
                 let env = Envelope::new(&cfg.device_id, "connections", ev);
                 emit(&*sink_instance, &env);
                 events_sent += 1;
             }
             _ = tick_listen.tick() => {
-                let ev = collect::collect_listeners();
+                let ev = tokio::task::spawn_blocking(collect::collect_listeners)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("listener scan failed: {e}");
+                        Vec::new()
+                    });
                 let env = Envelope::new(&cfg.device_id, "listeners", ev);
                 emit(&*sink_instance, &env);
                 events_sent += 1;
@@ -131,7 +181,14 @@ async fn main() -> anyhow::Result<()> {
                     emit(&*sink_instance, &env);
                     events_sent += 1;
                 }
-                for ev in tamper::check_tampering(&sys) {
+                let pids: Vec<u32> = sys.processes().keys().map(|p| p.as_u32()).collect();
+                let tamper_evs = tokio::task::spawn_blocking(move || {
+                    tamper::check_tampering(&pids)
+                }).await.unwrap_or_else(|e| {
+                    tracing::error!("tamper check failed: {e}");
+                    Vec::new()
+                });
+                for ev in tamper_evs {
                     let env = Envelope::new(&cfg.device_id, "tamper", ev);
                     emit(&*sink_instance, &env);
                     events_sent += 1;
@@ -145,4 +202,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    Ok(())
 }

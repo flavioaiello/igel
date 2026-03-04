@@ -1,0 +1,45 @@
+id: a1b2c3d4-1004-4000-a000-000000000004
+name: Igel - Critical File Modified (FIM)
+description: |
+  Detects modifications or deletions of security-critical files — /etc/passwd,
+  /etc/shadow, /etc/ssh/sshd_config, and similar identity or access-control
+  files.  On a stable IoT device these files change only during planned
+  provisioning; runtime changes indicate account manipulation, credential
+  harvesting, or configuration tampering.
+severity: High
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 1m
+queryPeriod: 1m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Persistence
+  - CredentialAccess
+  - Impact
+relevantTechniques:
+  - T1098
+  - T1565.001
+query: |
+  let critical_paths = dynamic(["/etc/passwd", "/etc/shadow", "/etc/group",
+                                "/etc/sudoers", "/etc/ssh/sshd_config",
+                                "/etc/pam.d/", "/etc/securetty"]);
+  Igel_CL
+  | where kind == "fim"
+  | where change in ("modified", "deleted")
+  | where path has_any (critical_paths)
+  | project TimeGenerated, device, path, change, sha256, prev_sha256, size
+  | extend HostName = device, FileHashValue = sha256, FileHashAlgorithm = "SHA256"
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName
+  - entityType: FileHash
+    fieldMappings:
+      - identifier: Value
+        columnName: FileHashValue
+      - identifier: Algorithm
+        columnName: FileHashAlgorithm

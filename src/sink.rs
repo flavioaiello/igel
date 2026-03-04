@@ -32,7 +32,12 @@ pub struct HttpSink {
     url: String,
     auth_token: Option<String>,
     buffer_path: Option<String>,
+    inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
+
+#[cfg(feature = "http")]
+/// Maximum concurrent inflight HTTP POST requests.
+const MAX_HTTP_INFLIGHT: usize = 16;
 
 #[cfg(feature = "http")]
 impl HttpSink {
@@ -42,6 +47,7 @@ impl HttpSink {
             url,
             auth_token,
             buffer_path,
+            inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_INFLIGHT)),
         }
     }
 }
@@ -66,6 +72,17 @@ fn buffer_event(path: &str, json: &[u8]) {
 #[cfg(feature = "http")]
 impl Sink for HttpSink {
     fn emit(&self, json: &[u8]) {
+        let permit = match self.inflight.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("http sink: at capacity, buffering event");
+                if let Some(ref path) = self.buffer_path {
+                    buffer_event(path, json);
+                }
+                return;
+            }
+        };
+
         let body = json.to_vec();
         let url = self.url.clone();
         let client = self.client.clone();
@@ -73,6 +90,7 @@ impl Sink for HttpSink {
         let buffer_path = self.buffer_path.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let mut req = client
                 .post(&url)
                 .header("content-type", "application/json");
@@ -137,14 +155,19 @@ pub async fn drain_buffer(url: &str, auth_token: Option<&str>, buffer_path: &str
 // ── MQTT sink ──
 
 #[cfg(feature = "mqtt")]
+/// Maximum concurrent inflight MQTT publish tasks.
+const MAX_MQTT_INFLIGHT: usize = 32;
+
+#[cfg(feature = "mqtt")]
 pub struct MqttSink {
     client: rumqttc::AsyncClient,
     device_id: String,
+    inflight: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 #[cfg(feature = "mqtt")]
 impl MqttSink {
-    pub fn new(host: String, device_id: String, sas_token: Option<String>) -> Self {
+    pub fn new(host: String, device_id: String, sas_token: Option<String>) -> anyhow::Result<Self> {
         let mut mqttoptions = rumqttc::MqttOptions::new(
             &device_id,
             host.as_str(),
@@ -160,8 +183,17 @@ impl MqttSink {
         }
 
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs") {
-            root_store.add(cert).unwrap();
+        let cert_result = rustls_native_certs::load_native_certs();
+        for e in &cert_result.errors {
+            tracing::warn!("error loading platform certificate: {e}");
+        }
+        if cert_result.certs.is_empty() {
+            anyhow::bail!("no platform TLS certificates found");
+        }
+        for cert in cert_result.certs {
+            if let Err(e) = root_store.add(cert) {
+                tracing::warn!("skipping malformed root certificate: {e}");
+            }
         }
 
         let client_config = rustls::ClientConfig::builder()
@@ -180,21 +212,31 @@ impl MqttSink {
             }
         });
 
-        Self {
+        Ok(Self {
             client,
             device_id,
-        }
+            inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_MQTT_INFLIGHT)),
+        })
     }
 }
 
 #[cfg(feature = "mqtt")]
 impl Sink for MqttSink {
     fn emit(&self, json: &[u8]) {
+        let permit = match self.inflight.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!("mqtt sink: at capacity, dropping event");
+                return;
+            }
+        };
+
         let topic = format!("devices/{}/messages/events/", self.device_id);
         let client = self.client.clone();
         let payload = json.to_vec();
 
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = client.publish(topic, rumqttc::QoS::AtLeastOnce, false, payload).await {
                 tracing::error!("Failed to publish MQTT message: {:?}", e);
             }

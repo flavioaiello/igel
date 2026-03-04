@@ -1,0 +1,32 @@
+id: a1b2c3d4-1011-4000-a000-000000000011
+name: Igel - Unauthorized Read-Write Mount on Critical Path
+description: |
+  Fires when Igel detects that a critical filesystem path (/, /usr, /bin) is
+  mounted read-write.  Hardened IoT devices mount these paths read-only; a
+  runtime switch to read-write indicates an attacker (or malicious firmware
+  update) preparing to modify system binaries in place.
+severity: Critical
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+  - Impact
+relevantTechniques:
+  - T1006
+query: |
+  Igel_CL
+  | where kind == "tamper"
+  | where signal == "unauthorized_rw"
+  | project TimeGenerated, device, category, signal, severity, detail
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

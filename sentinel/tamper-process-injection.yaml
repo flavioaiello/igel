@@ -1,0 +1,32 @@
+id: a1b2c3d4-1009-4000-a000-000000000009
+name: Igel - Active Process Injection Detected (ptrace)
+description: |
+  Fires when Igel's tamper-detection scan finds a process with a non-zero
+  TracerPid — meaning another process has attached via ptrace.  On production
+  IoT devices, ptrace attachment is never expected; it indicates an active
+  debugger, code injector, or credential-dumping tool.
+severity: Critical
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - PrivilegeEscalation
+  - DefenseEvasion
+relevantTechniques:
+  - T1055
+query: |
+  Igel_CL
+  | where kind == "tamper"
+  | where signal == "active_ptrace"
+  | project TimeGenerated, device, category, signal, severity, detail
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

@@ -1,0 +1,47 @@
+id: a1b2c3d4-1005-4000-a000-000000000005
+name: Igel - Persistence Implant Detected (FIM)
+description: |
+  Detects file changes in autostart, init, library preload, and systemd paths
+  that are commonly used to establish persistence on Linux IoT devices.
+  Modifications to these paths outside a firmware update window are high-
+  confidence indicators of a persistence implant or execution-flow hijack.
+severity: High
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 1m
+queryPeriod: 1m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Persistence
+  - DefenseEvasion
+relevantTechniques:
+  - T1547
+  - T1574
+query: |
+  let persistence_paths = dynamic([
+      "/etc/rc.local", "/etc/init.d/", "/etc/crontab",
+      "/etc/cron.d/", "/etc/cron.daily/", "/etc/cron.hourly/",
+      "/etc/systemd/system/", "/lib/systemd/system/",
+      "/etc/ld.so.preload", "/etc/ld.so.conf", "/etc/ld.so.conf.d/",
+      "/usr/lib/", "/lib/"
+  ]);
+  Igel_CL
+  | where kind == "fim"
+  | where change in ("modified", "created")
+  | where path has_any (persistence_paths)
+  | project TimeGenerated, device, path, change, sha256, prev_sha256, size
+  | extend HostName = device, FileHashValue = sha256, FileHashAlgorithm = "SHA256"
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName
+  - entityType: FileHash
+    fieldMappings:
+      - identifier: Value
+        columnName: FileHashValue
+      - identifier: Algorithm
+        columnName: FileHashAlgorithm

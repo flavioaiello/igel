@@ -1,0 +1,32 @@
+id: a1b2c3d4-1010-4000-a000-000000000010
+name: Igel - Kernel Integrity Violation (Taint Flag)
+description: |
+  Fires when the Linux kernel taint flag is non-zero, indicating unsigned kernel
+  modules, forced module loads, or other kernel-level integrity violations.
+  On a locked-down IoT device, any kernel taint is a critical indicator of
+  rootkit installation or unauthorized driver loading.
+severity: Critical
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+  - Persistence
+relevantTechniques:
+  - T1014
+query: |
+  Igel_CL
+  | where kind == "tamper"
+  | where signal == "kernel_tainted"
+  | project TimeGenerated, device, category, signal, severity, detail
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

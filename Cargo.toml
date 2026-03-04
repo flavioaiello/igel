@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
-serde_json = "1"
+serde_json = { version = "1", default-features = false, features = ["std"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "network"] }
 sha2 = { version = "0.10", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -34,8 +34,11 @@ rustls-native-certs = { version = "0.8", optional = true }
 rustls = { version = "0.23.37", default-features = false, features = ["std"], optional = true }
 anyhow = "1.0.102"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4", optional = true }
+
 [features]
-default = ["http", "mqtt"]
+default = ["http", "mqtt", "landlock"]
 http = ["reqwest"]
 mqtt = ["rumqttc", "rustls-native-certs", "rustls"]
 

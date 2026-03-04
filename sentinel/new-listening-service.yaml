@@ -1,0 +1,38 @@
+id: a1b2c3d4-1002-4000-a000-000000000002
+name: Igel - Unauthorized Listening Service on IoT Device
+description: |
+  Detects new listening sockets on well-known service ports (SSH, Telnet, VNC,
+  HTTP, RDP) that should not be open on a hardened IoT device.  An attacker who
+  gains code execution often drops a reverse shell or binds a remote-access
+  daemon for persistence.
+severity: High
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CommandAndControl
+  - LateralMovement
+relevantTechniques:
+  - T1021
+  - T1090
+query: |
+  let suspicious_ports = dynamic([22, 23, 80, 443, 3389, 4444, 5900, 5901, 8080, 8443, 9090]);
+  Igel_CL
+  | where kind == "listeners"
+  | where port in (suspicious_ports)
+  | project TimeGenerated, device, protocol, addr, port, pid, process_name
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName
+  - entityType: Process
+    fieldMappings:
+      - identifier: ProcessId
+        columnName: pid

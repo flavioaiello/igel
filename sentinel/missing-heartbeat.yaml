@@ -1,0 +1,44 @@
+id: a1b2c3d4-1012-4000-a000-000000000012
+name: Igel - Missing Sensor Heartbeat
+description: |
+  Fires when an Igel device has not sent a heartbeat event within the expected
+  interval (default: 5 minutes).  Absence of heartbeats indicates the sensor
+  process has been killed, the device is offline, or an attacker is blocking
+  egress to suppress telemetry.  Requires a baseline of known device IDs; adjust
+  the heartbeat_threshold to match your configured heartbeat_interval.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 30m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+relevantTechniques:
+  - T1562.001
+query: |
+  let heartbeat_threshold = 5m;
+  let known_devices = (
+      Igel_CL
+      | where TimeGenerated > ago(30d)
+      | where kind == "heartbeat"
+      | distinct device
+  );
+  let last_seen = (
+      Igel_CL
+      | where kind == "heartbeat"
+      | summarize LastHeartbeat = max(TimeGenerated) by device
+  );
+  known_devices
+  | join kind=leftouter last_seen on device
+  | where isnull(LastHeartbeat) or LastHeartbeat < ago(heartbeat_threshold)
+  | project device, LastHeartbeat, TimeSinceLastHeartbeat = now() - LastHeartbeat
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

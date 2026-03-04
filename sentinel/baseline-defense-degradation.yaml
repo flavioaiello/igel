@@ -1,0 +1,40 @@
+id: a1b2c3d4-1007-4000-a000-000000000007
+name: Igel - System Defense Degradation Detected
+description: |
+  Fires when Igel baseline checks detect that kernel-level defenses have been
+  weakened: ASLR disabled, core dumps allowed, IP forwarding enabled, SYN
+  cookies disabled, ICMP redirects or source routing accepted, or /tmp mounted
+  without noexec/nosuid.  These changes lower the bar for exploitation and
+  lateral movement.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - DefenseEvasion
+relevantTechniques:
+  - T1548
+  - T1562
+query: |
+  let defense_checks = dynamic([
+      "aslr-enabled", "core-dumps-restricted",
+      "ip-forwarding-disabled", "syn-cookies-enabled",
+      "icmp-redirects-disabled", "source-route-disabled",
+      "tmp-noexec", "tmp-nosuid"
+  ]);
+  Igel_CL
+  | where kind == "baseline"
+  | where check in (defense_checks)
+  | where pass == false
+  | project TimeGenerated, device, check, category, detail, severity
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

@@ -1,0 +1,42 @@
+id: a1b2c3d4-1013-4000-a000-000000000013
+name: Igel - Resource Hijacking (CPU/Memory Anomaly)
+description: |
+  Detects sustained high CPU or memory usage reported in Igel heartbeat events.
+  IoT devices have predictable resource consumption; a sudden spike often
+  indicates a cryptominer, DDoS bot, or runaway exploit payload.  Thresholds
+  should be tuned per device profile — the defaults (CPU > 80%, RAM > 90%)
+  are conservative starting points.
+severity: Medium
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 15m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Impact
+relevantTechniques:
+  - T1496
+query: |
+  let cpu_threshold = 80.0;
+  let mem_threshold = 90.0;
+  Igel_CL
+  | where kind == "heartbeat"
+  | where cpu > cpu_threshold or mem_pct > mem_threshold
+  | summarize
+      AvgCpu = avg(cpu),
+      MaxCpu = max(cpu),
+      AvgMem = avg(mem_pct),
+      MaxMem = max(mem_pct),
+      SampleCount = count()
+    by device, bin(TimeGenerated, 5m)
+  | where SampleCount >= 2
+  | project TimeGenerated, device, AvgCpu, MaxCpu, AvgMem, MaxMem, SampleCount
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

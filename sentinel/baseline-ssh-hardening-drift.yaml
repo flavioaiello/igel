@@ -1,0 +1,35 @@
+id: a1b2c3d4-1006-4000-a000-000000000006
+name: Igel - SSH Hardening Baseline Drift
+description: |
+  Fires when an Igel baseline check detects that SSH hardening settings have
+  drifted from the expected secure state: PermitRootLogin allowed,
+  MaxAuthTries too high, or PermitEmptyPasswords enabled.  On IoT devices SSH
+  is often the only remote-management plane — weakened settings expose the
+  device to brute-force and credential-stuffing attacks.
+severity: High
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 1h
+queryPeriod: 1h
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - CredentialAccess
+  - DefenseEvasion
+relevantTechniques:
+  - T1556
+query: |
+  Igel_CL
+  | where kind == "baseline"
+  | where category == "auth"
+  | where check in ("ssh-no-root", "ssh-max-auth-tries", "ssh-no-empty-passwords")
+  | where pass == false
+  | project TimeGenerated, device, check, detail, severity
+  | extend HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName

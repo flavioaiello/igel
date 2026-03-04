@@ -290,7 +290,7 @@ pub fn start_fim_monitor(paths: Vec<String>) -> tokio::sync::mpsc::Receiver<FimE
             }
         }
 
-        let (notify_tx, notify_rx) = flume::unbounded();
+        let (notify_tx, notify_rx) = flume::bounded(256);
 
         let mut watcher = match notify::recommended_watcher(move |res| {
             if let Ok(event) = res {

@@ -1,0 +1,38 @@
+id: a1b2c3d4-1001-4000-a000-000000000001
+name: Igel - Unexpected Script Interpreter on IoT Device
+description: |
+  Detects script interpreters (python, sh, bash, perl, lua, ruby, node) running
+  on a headless IoT/OT device where interactive shells should not exist.
+  Legitimate firmware should not spawn general-purpose interpreters — their
+  presence indicates hands-on-keyboard activity or a dropped payload.
+severity: High
+requiredDataConnectors:
+  - connectorId: CustomLogsAma
+    dataTypes:
+      - Igel_CL
+queryFrequency: 5m
+queryPeriod: 5m
+triggerOperator: gt
+triggerThreshold: 0
+tactics:
+  - Execution
+relevantTechniques:
+  - T1059
+query: |
+  Igel_CL
+  | where kind == "processes"
+  | where name in~ ("python", "python3", "perl", "lua", "ruby", "node",
+                     "bash", "sh", "dash", "zsh", "ash", "csh", "ksh")
+  | project TimeGenerated, device, name, cmd, pid, ppid, user
+  | extend AccountName = user, HostName = device
+entityMappings:
+  - entityType: Host
+    fieldMappings:
+      - identifier: HostName
+        columnName: HostName
+  - entityType: Process
+    fieldMappings:
+      - identifier: ProcessId
+        columnName: pid
+      - identifier: CommandLine
+        columnName: cmd

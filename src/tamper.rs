@@ -1,6 +1,5 @@
 use std::fs;
 use serde::Serialize;
-use sysinfo::System;
 #[derive(Debug, Serialize)]
 pub struct TamperEvent {
     pub category: String,
@@ -9,9 +8,9 @@ pub struct TamperEvent {
     pub detail: String,
 }
 
-pub fn check_tampering(sys: &System) -> Vec<TamperEvent> {
+pub fn check_tampering(pids: &[u32]) -> Vec<TamperEvent> {
     let mut evs = Vec::new();
-    for (pid, _) in sys.processes() {
+    for pid in pids {
         if let Ok(st) = fs::read_to_string(format!("/proc/{}/status", pid)) {
             for ln in st.lines() {
                 if ln.starts_with("TracerPid:") {

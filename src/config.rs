@@ -14,8 +14,6 @@ pub struct Config {
     #[serde(default = "default_network_interval")]
     pub network_interval: u64,
 
-    /// Seconds between FIM checks.
-
     /// Seconds between baseline checks.
     #[serde(default = "default_baseline_interval")]
     pub baseline_interval: u64,
@@ -63,13 +61,25 @@ impl Config {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let cfg: Config = toml::from_str(&text)?;
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.process_interval == 0 { anyhow::bail!("process_interval must be > 0"); }
+        if self.network_interval == 0 { anyhow::bail!("network_interval must be > 0"); }
+        if self.connection_interval == 0 { anyhow::bail!("connection_interval must be > 0"); }
+        if self.listener_interval == 0 { anyhow::bail!("listener_interval must be > 0"); }
+        if self.baseline_interval == 0 { anyhow::bail!("baseline_interval must be > 0"); }
+        if self.heartbeat_interval == 0 { anyhow::bail!("heartbeat_interval must be > 0"); }
+        Ok(())
     }
 
     /// Parse directly from a TOML string (used by tests).
     #[cfg(test)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
         let cfg: Config = toml::from_str(s)?;
+        cfg.validate()?;
         Ok(cfg)
     }
 }
@@ -164,5 +174,14 @@ mod tests {
             process_interval = "not a number"
         "#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn zero_interval_rejected() {
+        let result = Config::from_str(r#"
+            device_id = "test"
+            process_interval = 0
+        "#);
+        assert!(result.is_err(), "zero interval must be rejected");
     }
 }
