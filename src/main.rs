@@ -46,7 +46,11 @@ async fn main() {
     // ── Sink ─────────────────────────────────────────────────
     #[cfg(feature = "http")]
     let sink: Box<dyn Sink> = if let Some(ref url) = cfg.http_url {
-        Box::new(sink::HttpSink::new(url.clone()))
+        Box::new(sink::HttpSink::new(
+            url.clone(),
+            cfg.http_auth_token.clone(),
+            cfg.buffer_path.clone(),
+        ))
     } else {
         Box::new(StdoutSink)
     };
@@ -61,9 +65,12 @@ async fn main() {
 
     let mut tick_proc = interval(Duration::from_secs(cfg.process_interval));
     let mut tick_net = interval(Duration::from_secs(cfg.network_interval));
+    let mut tick_conn = interval(Duration::from_secs(cfg.connection_interval));
+    let mut tick_listen = interval(Duration::from_secs(cfg.listener_interval));
     let mut tick_fim = interval(Duration::from_secs(cfg.fim_interval));
     let mut tick_base = interval(Duration::from_secs(cfg.baseline_interval));
     let mut tick_hb = interval(Duration::from_secs(cfg.heartbeat_interval));
+    let mut tick_drain = interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
@@ -79,6 +86,20 @@ async fn main() {
                 networks.refresh(true);
                 for ev in collect::collect_network(&networks) {
                     let env = Envelope::new(&cfg.device_id, "network", ev);
+                    send(&*sink, &env);
+                    events_sent += 1;
+                }
+            }
+            _ = tick_conn.tick() => {
+                for ev in collect::collect_connections() {
+                    let env = Envelope::new(&cfg.device_id, "connection", ev);
+                    send(&*sink, &env);
+                    events_sent += 1;
+                }
+            }
+            _ = tick_listen.tick() => {
+                for ev in collect::collect_listeners() {
+                    let env = Envelope::new(&cfg.device_id, "listener", ev);
                     send(&*sink, &env);
                     events_sent += 1;
                 }
@@ -103,6 +124,19 @@ async fn main() {
                 let env = Envelope::new(&cfg.device_id, "heartbeat", hb);
                 send(&*sink, &env);
                 events_sent += 1;
+            }
+            _ = tick_drain.tick() => {
+                #[cfg(feature = "http")]
+                if let (Some(ref url), Some(ref buf_path)) = (&cfg.http_url, &cfg.buffer_path) {
+                    let drained = sink::drain_buffer(
+                        url,
+                        cfg.http_auth_token.as_deref(),
+                        buf_path,
+                    ).await;
+                    if drained > 0 {
+                        info!(count = drained, "drained buffered events");
+                    }
+                }
             }
         }
     }

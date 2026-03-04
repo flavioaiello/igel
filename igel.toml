@@ -1,9 +1,11 @@
 device_id = "sensor-01"
 
-process_interval  = 60
-network_interval  = 30
-fim_interval      = 300
-baseline_interval = 3600
+process_interval   = 60
+network_interval   = 30
+connection_interval = 60
+listener_interval  = 300
+fim_interval       = 300
+baseline_interval  = 3600
 heartbeat_interval = 60
 
 fim_paths = [
@@ -14,3 +16,5 @@ fim_paths = [
 
 # Requires --features http
 # http_url = "https://ingest.example.com/v1/events"
+# http_auth_token = "your-bearer-token-here"
+# buffer_path = "/var/lib/igel/buffer.ndjson"

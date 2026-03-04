@@ -9,8 +9,10 @@ Outputs NDJSON to **stdout** — pipe it to any SIEM, cloud ingestion, or log co
 |---|---|
 | `process` | Running process snapshot (pid, ppid, name, cmd, user, cpu, mem) |
 | `network` | Interface TX/RX byte counters |
+| `connection` | Active TCP/UDP connections with PID resolution (Linux) |
+| `listener` | Listening network sockets with PID resolution (Linux) |
 | `fim` | File integrity monitoring (SHA-256 change detection) |
-| `baseline` | CIS-style security baseline checks |
+| `baseline` | CIS-style security baseline checks (15 checks, Linux) |
 | `heartbeat` | System vitals + uptime + event counter |
 
 Every event is wrapped in a uniform `Envelope` with `ts`, `device`, `kind`, and `v` (schema version).
@@ -48,6 +50,8 @@ device_id = "sensor-42"
 
 process_interval  = 60    # seconds
 network_interval  = 30
+connection_interval = 60
+listener_interval = 300
 fim_interval      = 300
 baseline_interval = 3600
 heartbeat_interval = 60
@@ -60,6 +64,8 @@ fim_paths = [
 
 # Requires `--features http`
 # http_url = "https://ingest.example.com/v1/events"
+# http_auth_token = "your-bearer-token-here"
+# buffer_path = "/var/lib/igel/buffer.ndjson"
 ```
 
 ## Run

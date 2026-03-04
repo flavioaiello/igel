@@ -26,6 +26,14 @@ pub struct Config {
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
 
+    /// Seconds between connection scans.
+    #[serde(default = "default_connection_interval")]
+    pub connection_interval: u64,
+
+    /// Seconds between listener scans.
+    #[serde(default = "default_listener_interval")]
+    pub listener_interval: u64,
+
     /// File paths to watch for integrity changes.
     #[serde(default)]
     pub fim_paths: Vec<String>,
@@ -33,11 +41,21 @@ pub struct Config {
     /// Optional HTTP endpoint for the sink (requires `http` feature).
     #[cfg_attr(not(feature = "http"), allow(dead_code))]
     pub http_url: Option<String>,
+
+    /// Bearer token for HTTP sink authentication.
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub http_auth_token: Option<String>,
+
+    /// Path for event buffer file (disk-backed delivery guarantee).
+    #[cfg_attr(not(feature = "http"), allow(dead_code))]
+    pub buffer_path: Option<String>,
 }
 
 fn default_process_interval() -> u64 { 60 }
 fn default_network_interval() -> u64 { 30 }
 fn default_fim_interval() -> u64 { 300 }
+fn default_connection_interval() -> u64 { 60 }
+fn default_listener_interval() -> u64 { 300 }
 fn default_baseline_interval() -> u64 { 3600 }
 fn default_heartbeat_interval() -> u64 { 60 }
 

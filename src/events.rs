@@ -76,6 +76,31 @@ pub struct BaselineEvent {
     pub severity: &'static str, // "low" | "medium" | "high" | "critical"
 }
 
+// ── Connection events ─────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ConnectionEvent {
+    pub protocol: String,
+    pub local_addr: String,
+    pub local_port: u16,
+    pub remote_addr: String,
+    pub remote_port: u16,
+    pub state: String,
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
+}
+
+// ── Listener events ──────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ListenerEvent {
+    pub protocol: String,
+    pub addr: String,
+    pub port: u16,
+    pub pid: Option<u32>,
+    pub process_name: Option<String>,
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
