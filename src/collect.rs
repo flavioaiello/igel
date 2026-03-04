@@ -271,54 +271,111 @@ pub fn collect_listeners() -> Vec<ListenerEvent> {
     Vec::new()
 }
 
-/// Check watched files for changes. Returns events only when something changed.
-pub async fn check_fim(
-    paths: &[String],
-    known: &mut HashMap<String, String>,
-) -> Vec<FimEvent> {
-    let mut out = Vec::new();
+/// Starts a push-based File Integrity Monitoring (FIM) watcher.
+pub fn start_fim_monitor(paths: Vec<String>) -> tokio::sync::mpsc::Receiver<FimEvent> {
+    use notify::{EventKind, RecursiveMode, Watcher};
 
-    for path_str in paths {
-        let path = Path::new(path_str);
-        match fs::read(path).await {
-            Ok(contents) => {
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+    tokio::spawn(async move {
+        let mut known: HashMap<String, String> = HashMap::new();
+
+        // Baseline initial hashes
+        for path_str in &paths {
+            let path = Path::new(path_str);
+            if let Ok(contents) = fs::read(path).await {
                 let mut h = Sha256::new();
                 h.update(&contents);
-                let hash = format!("{:x}", h.finalize());
-                let size = contents.len() as u64;
-
-                let prev = known.get(path_str).cloned();
-                let change = match &prev {
-                    Some(old) if old != &hash => "modified",
-                    None => "created",
-                    _ => continue,
-                };
-
-                debug!(path = path_str, change, "FIM event");
-                out.push(FimEvent {
-                    path: path_str.clone(),
-                    sha256: hash.clone(),
-                    prev_sha256: prev,
-                    change,
-                    size,
-                });
-                known.insert(path_str.clone(), hash);
+                known.insert(path_str.clone(), format!("{:x}", h.finalize()));
             }
-            Err(_) => {
-                if known.remove(path_str).is_some() {
-                    warn!(path = path_str, "Watched file deleted");
-                    out.push(FimEvent {
-                        path: path_str.clone(),
-                        sha256: String::new(),
-                        prev_sha256: None,
-                        change: "deleted",
-                        size: 0,
-                    });
+        }
+
+        let (notify_tx, notify_rx) = flume::unbounded();
+
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            if let Ok(event) = res {
+                let _ = notify_tx.send(event);
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(err = %e, "Failed to start FIM watcher");
+                return;
+            }
+        };
+
+        for path_str in &paths {
+            let path = Path::new(path_str);
+            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                warn!(path = path_str, err = %e, "Failed to watch FIM path");
+            } else {
+                debug!(path = path_str, "Watching FIM path");
+            }
+        }
+
+        // Keep running and process async events
+        while let Ok(event) = notify_rx.recv_async().await {
+            // We only care about data modification, creation, or deletion
+            let is_relevant = matches!(
+                event.kind,
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+            );
+
+            if !is_relevant {
+                continue;
+            }
+
+            for path in event.paths {
+                let path_str = path.to_string_lossy().to_string();
+                
+                // Read and hash the new file content
+                match fs::read(&path).await {
+                    Ok(contents) => {
+                        let mut h = Sha256::new();
+                        h.update(&contents);
+                        let hash = format!("{:x}", h.finalize());
+                        let size = contents.len() as u64;
+
+                        let prev = known.get(&path_str).cloned();
+                        let change = match &prev {
+                            Some(old) if old != &hash => "modified",
+                            None => "created",
+                            _ => continue, // Unchanged hash
+                        };
+
+                        debug!(path = %path_str, change, "FIM event");
+                        let _ = tx.send(FimEvent {
+                            path: path_str.clone(),
+                            sha256: hash.clone(),
+                            prev_sha256: prev,
+                            change,
+                            size,
+                        }).await;
+                        
+                        known.insert(path_str, hash);
+                    }
+                    Err(_) => {
+                        // File might have been deleted
+                        if known.remove(&path_str).is_some() {
+                            warn!(path = %path_str, "Watched file deleted");
+                            let _ = tx.send(FimEvent {
+                                path: path_str,
+                                sha256: String::new(),
+                                prev_sha256: None,
+                                change: "deleted",
+                                size: 0,
+                            }).await;
+                        }
+                    }
                 }
             }
         }
-    }
-    out
+        
+        // Ensure watcher is not dropped
+        drop(watcher);
+    });
+
+    rx
 }
 
 /// Run security baseline checks (CIS-style, 15 checks).
@@ -556,5 +613,221 @@ pub fn heartbeat(sys: &System, events_sent: u64) -> Heartbeat {
         cpu: sys.global_cpu_usage(),
         mem_pct: (sys.used_memory() as f32 / sys.total_memory().max(1) as f32) * 100.0,
         events_sent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── procnet parser tests (Linux-only but pure logic) ─────────────
+
+    #[cfg(target_os = "linux")]
+    mod procnet_tests {
+        use super::super::procnet;
+
+        #[test]
+        fn parse_ipv4_loopback() {
+            // 0100007F = 127.0.0.1 in little-endian /proc format
+            assert_eq!(procnet::parse_ipv4("0100007F"), "127.0.0.1");
+        }
+
+        #[test]
+        fn parse_ipv4_zeros() {
+            assert_eq!(procnet::parse_ipv4("00000000"), "0.0.0.0");
+        }
+
+        #[test]
+        fn parse_ipv4_broadcast() {
+            // FFFFFFFF = 255.255.255.255
+            assert_eq!(procnet::parse_ipv4("FFFFFFFF"), "255.255.255.255");
+        }
+
+        #[test]
+        fn parse_ipv4_typical_addr() {
+            // C0A80164 = 192.168.1.100 in network order, but /proc stores little-endian:
+            // 192.168.1.100 → 0x6401A8C0
+            assert_eq!(procnet::parse_ipv4("6401A8C0"), "192.168.1.100");
+        }
+
+        #[test]
+        fn parse_ipv4_invalid_hex_returns_zeros() {
+            assert_eq!(procnet::parse_ipv4("ZZZZZZZZ"), "0.0.0.0");
+        }
+
+        #[test]
+        fn parse_ipv6_loopback() {
+            // ::1 in /proc/net/tcp6 format (little-endian per 32-bit group)
+            assert_eq!(
+                procnet::parse_ipv6("00000000000000000000000001000000"),
+                "::1"
+            );
+        }
+
+        #[test]
+        fn parse_ipv6_all_zeros() {
+            assert_eq!(
+                procnet::parse_ipv6("00000000000000000000000000000000"),
+                "::"
+            );
+        }
+
+        #[test]
+        fn parse_ipv6_wrong_length_returns_input() {
+            assert_eq!(procnet::parse_ipv6("SHORT"), "SHORT");
+            assert_eq!(procnet::parse_ipv6(""), "");
+        }
+
+        #[test]
+        fn parse_port_common_values() {
+            assert_eq!(procnet::parse_port("0050"), 80);
+            assert_eq!(procnet::parse_port("01BB"), 443);
+            assert_eq!(procnet::parse_port("0016"), 22);
+            assert_eq!(procnet::parse_port("0000"), 0);
+            assert_eq!(procnet::parse_port("FFFF"), 65535);
+        }
+
+        #[test]
+        fn parse_port_invalid_hex_returns_zero() {
+            assert_eq!(procnet::parse_port("ZZZZ"), 0);
+        }
+
+        #[test]
+        fn tcp_state_all_known_states() {
+            assert_eq!(procnet::tcp_state("01"), "ESTABLISHED");
+            assert_eq!(procnet::tcp_state("02"), "SYN_SENT");
+            assert_eq!(procnet::tcp_state("03"), "SYN_RECV");
+            assert_eq!(procnet::tcp_state("04"), "FIN_WAIT1");
+            assert_eq!(procnet::tcp_state("05"), "FIN_WAIT2");
+            assert_eq!(procnet::tcp_state("06"), "TIME_WAIT");
+            assert_eq!(procnet::tcp_state("07"), "CLOSE");
+            assert_eq!(procnet::tcp_state("08"), "CLOSE_WAIT");
+            assert_eq!(procnet::tcp_state("09"), "LAST_ACK");
+            assert_eq!(procnet::tcp_state("0A"), "LISTEN");
+            assert_eq!(procnet::tcp_state("0B"), "CLOSING");
+        }
+
+        #[test]
+        fn tcp_state_unknown_value() {
+            assert_eq!(procnet::tcp_state("FF"), "UNKNOWN");
+            assert_eq!(procnet::tcp_state("00"), "UNKNOWN");
+            assert_eq!(procnet::tcp_state("ZZ"), "UNKNOWN");
+        }
+
+        #[test]
+        fn parse_proc_net_nonexistent_file_returns_empty() {
+            let result = procnet::parse_proc_net("/tmp/igel_nonexistent_file_83724", false);
+            assert!(result.is_empty());
+        }
+
+        #[test]
+        fn parse_proc_net_tcp_format() {
+            // Write a synthetic /proc/net/tcp file
+            let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0CEA 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0";
+            let path = std::env::temp_dir().join("igel_test_proc_net_tcp");
+            std::fs::write(&path, content).expect("write");
+
+            let conns = procnet::parse_proc_net(path.to_str().expect("path"), false);
+            assert_eq!(conns.len(), 1);
+            assert_eq!(conns[0].local_addr, "127.0.0.1");
+            assert_eq!(conns[0].local_port, 3306);   // 0x0CEA
+            assert_eq!(conns[0].remote_addr, "0.0.0.0");
+            assert_eq!(conns[0].remote_port, 0);
+            assert_eq!(conns[0].state, "LISTEN");     // 0x0A
+            assert_eq!(conns[0].inode, 12345);
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn parse_proc_net_skips_malformed_lines() {
+            let content = "\
+  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   BAD LINE
+   0: 0100007F:0050 00000000:0000 01 00000000:00000000 00:00000000 00000000     0        0 99 1 0000000000000000 100 0 0 10 0";
+            let path = std::env::temp_dir().join("igel_test_proc_net_malformed");
+            std::fs::write(&path, content).expect("write");
+
+            let conns = procnet::parse_proc_net(path.to_str().expect("path"), false);
+            // Malformed line is skipped, valid line parsed
+            assert_eq!(conns.len(), 1);
+            assert_eq!(conns[0].local_port, 80);
+
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    // ── Cross-platform tests ─────────────────────────────────────────
+
+    #[test]
+    fn collect_processes_returns_nonempty() {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let procs = collect_processes(&sys);
+        assert!(!procs.is_empty(), "there should be at least one process running");
+    }
+
+    #[test]
+    fn collect_processes_includes_own_pid() {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let own_pid = std::process::id();
+        let procs = collect_processes(&sys);
+        // Our own process should appear in the list
+        assert!(
+            procs.iter().any(|p| p.pid == own_pid),
+            "own PID {} not found in process list",
+            own_pid
+        );
+    }
+
+    #[test]
+    fn collect_network_returns_results() {
+        let mut networks = sysinfo::Networks::new_with_refreshed_list();
+        networks.refresh(true);
+        let net = collect_network(&networks);
+        // Most systems have at least one network interface (lo/loopback)
+        // but don't make this a hard requirement—just verify types
+        for iface in &net {
+            assert!(!iface.iface.is_empty());
+        }
+    }
+
+    #[test]
+    fn heartbeat_captures_system_info() {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let hb = heartbeat(&sys, 42);
+
+        assert_eq!(hb.events_sent, 42);
+        assert!(hb.mem_pct >= 0.0 && hb.mem_pct <= 100.0, "mem_pct out of range: {}", hb.mem_pct);
+        assert!(hb.cpu >= 0.0, "cpu must be non-negative");
+    }
+
+    #[test]
+    fn heartbeat_serializes_to_json() {
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        let hb = heartbeat(&sys, 0);
+        let json = serde_json::to_value(&hb).expect("serialize");
+
+        assert!(json["os"].is_string());
+        assert!(json["os_version"].is_string());
+        assert!(json["uptime_secs"].is_u64());
+        assert_eq!(json["events_sent"], 0);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_connections_returns_empty() {
+        assert!(collect_connections().is_empty());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_listeners_returns_empty() {
+        assert!(collect_listeners().is_empty());
     }
 }

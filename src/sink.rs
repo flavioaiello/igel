@@ -1,3 +1,4 @@
+// src/sink.rs
 /// Abstraction over output destination.
 /// Accepts a pre-serialized JSON line (bytes) to stay dyn-compatible.
 pub trait Sink {
@@ -131,4 +132,180 @@ pub async fn drain_buffer(url: &str, auth_token: Option<&str>, buffer_path: &str
     // All events delivered; truncate buffer
     let _ = tokio::fs::write(buffer_path, b"").await;
     total
+}
+
+// ── MQTT sink ──
+
+#[cfg(feature = "mqtt")]
+pub struct MqttSink {
+    client: rumqttc::AsyncClient,
+    device_id: String,
+}
+
+#[cfg(feature = "mqtt")]
+impl MqttSink {
+    pub fn new(host: String, device_id: String, sas_token: Option<String>) -> Self {
+        let mut mqttoptions = rumqttc::MqttOptions::new(
+            &device_id,
+            host.as_str(),
+            8883,
+        );
+        mqttoptions.set_keep_alive(std::time::Duration::from_secs(30));
+
+        if let Some(token) = sas_token {
+            mqttoptions.set_credentials(
+                format!("{}/{}/?api-version=2020-09-30", host, device_id),
+                token,
+            );
+        }
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().expect("could not load platform certs") {
+            root_store.add(cert).unwrap();
+        }
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        mqttoptions.set_transport(rumqttc::Transport::tls_with_config(client_config.into()));
+        let (client, mut eventloop) = rumqttc::AsyncClient::new(mqttoptions, 100);
+
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = eventloop.poll().await {
+                    tracing::error!("MQTT connection error: {:?}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        });
+
+        Self {
+            client,
+            device_id,
+        }
+    }
+}
+
+#[cfg(feature = "mqtt")]
+impl Sink for MqttSink {
+    fn emit(&self, json: &[u8]) {
+        let topic = format!("devices/{}/messages/events/", self.device_id);
+        let client = self.client.clone();
+        let payload = json.to_vec();
+
+        tokio::spawn(async move {
+            if let Err(e) = client.publish(topic, rumqttc::QoS::AtLeastOnce, false, payload).await {
+                tracing::error!("Failed to publish MQTT message: {:?}", e);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_sink_emits_valid_json_line() {
+        // StdoutSink writes to actual stdout; we verify it implements Sink
+        // and doesn't panic on valid JSON input.
+        let sink = StdoutSink;
+        let json = br#"{"ts":"2025-01-01T00:00:00Z","kind":"test"}"#;
+        sink.emit(json); // Should not panic
+    }
+
+    #[test]
+    fn stdout_sink_handles_empty_input() {
+        let sink = StdoutSink;
+        sink.emit(b""); // Should not panic on empty input
+    }
+
+    #[test]
+    fn stdout_sink_handles_binary_data() {
+        let sink = StdoutSink;
+        sink.emit(&[0xFF, 0xFE, 0x00, 0x01]); // Should not panic on non-UTF8
+    }
+
+    /// Verify the Sink trait is object-safe (dyn-compatible).
+    #[test]
+    fn sink_trait_is_dyn_compatible() {
+        let sink: Box<dyn Sink> = Box::new(StdoutSink);
+        let json = br#"{"test": true}"#;
+        sink.emit(json);
+    }
+
+    #[cfg(feature = "http")]
+    mod http_tests {
+        use super::super::*;
+
+        #[test]
+        fn http_sink_constructs_without_auth() {
+            let sink = HttpSink::new(
+                "https://example.com/ingest".into(),
+                None,
+                None,
+            );
+            assert_eq!(sink.url, "https://example.com/ingest");
+            assert!(sink.auth_token.is_none());
+            assert!(sink.buffer_path.is_none());
+        }
+
+        #[test]
+        fn http_sink_constructs_with_auth_and_buffer() {
+            let sink = HttpSink::new(
+                "https://example.com/v1".into(),
+                Some("token-123".into()),
+                Some("/tmp/buf.ndjson".into()),
+            );
+            assert_eq!(sink.url, "https://example.com/v1");
+            assert_eq!(sink.auth_token.as_deref(), Some("token-123"));
+            assert_eq!(sink.buffer_path.as_deref(), Some("/tmp/buf.ndjson"));
+        }
+
+        #[test]
+        fn buffer_event_appends_to_file() {
+            let path = std::env::temp_dir().join("igel_test_buffer_event.ndjson");
+            let path_str = path.to_str().expect("path");
+
+            // Clean up from any prior run
+            let _ = std::fs::remove_file(&path);
+
+            buffer_event(path_str, br#"{"line":1}"#);
+            buffer_event(path_str, br#"{"line":2}"#);
+
+            let content = std::fs::read_to_string(&path).expect("read");
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0], r#"{"line":1}"#);
+            assert_eq!(lines[1], r#"{"line":2}"#);
+
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[tokio::test]
+        async fn drain_buffer_empty_file_returns_zero() {
+            let path = std::env::temp_dir().join("igel_test_drain_empty.ndjson");
+            tokio::fs::write(&path, b"").await.expect("write");
+
+            let count = drain_buffer(
+                "https://example.com/ingest",
+                None,
+                path.to_str().expect("path"),
+            ).await;
+            assert_eq!(count, 0);
+
+            tokio::fs::remove_file(&path).await.ok();
+        }
+
+        #[tokio::test]
+        async fn drain_buffer_nonexistent_file_returns_zero() {
+            let count = drain_buffer(
+                "https://example.com/ingest",
+                None,
+                "/tmp/igel_nonexistent_drain_837241.ndjson",
+            ).await;
+            assert_eq!(count, 0);
+        }
+    }
 }
