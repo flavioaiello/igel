@@ -16,9 +16,10 @@ use sink::{Sink, StdoutSink};
 use sink::HttpSink;
 
 /// Serialize an envelope and emit it through the sink.
+/// Passes ownership of the serialized bytes to avoid a redundant copy.
 fn emit<T: serde::Serialize>(sink: &dyn Sink, env: &Envelope<T>) {
     match serde_json::to_vec(env) {
-        Ok(json) => sink.emit(&json),
+        Ok(json) => sink.emit(json),
         Err(e) => tracing::error!("serialization error: {}", e),
     }
 }

@@ -69,8 +69,8 @@ pub struct FimEvent {
 
 #[derive(Debug, Serialize)]
 pub struct BaselineEvent {
-    pub check: String,
-    pub category: String,
+    pub check: &'static str,
+    pub category: &'static str,
     pub pass: bool,
     pub detail: String,
     pub severity: &'static str, // "low" | "medium" | "high" | "critical"
@@ -80,12 +80,12 @@ pub struct BaselineEvent {
 
 #[derive(Debug, Serialize)]
 pub struct ConnectionEvent {
-    pub protocol: String,
+    pub protocol: &'static str,
     pub local_addr: String,
     pub local_port: u16,
     pub remote_addr: String,
     pub remote_port: u16,
-    pub state: String,
+    pub state: &'static str,
     pub pid: Option<u32>,
     pub process_name: Option<String>,
 }
@@ -94,7 +94,7 @@ pub struct ConnectionEvent {
 
 #[derive(Debug, Serialize)]
 pub struct ListenerEvent {
-    pub protocol: String,
+    pub protocol: &'static str,
     pub addr: String,
     pub port: u16,
     pub pid: Option<u32>,
@@ -225,8 +225,8 @@ mod tests {
     fn baseline_event_severity_values() {
         for sev in &["low", "medium", "high", "critical"] {
             let ev = BaselineEvent {
-                check: "test".into(),
-                category: "test".into(),
+                check: "test",
+                category: "test",
                 pass: true,
                 detail: "ok".into(),
                 severity: sev,
@@ -239,12 +239,12 @@ mod tests {
     #[test]
     fn connection_event_fields() {
         let ev = ConnectionEvent {
-            protocol: "tcp".into(),
+            protocol: "tcp",
             local_addr: "127.0.0.1".into(),
             local_port: 8080,
             remote_addr: "10.0.0.1".into(),
             remote_port: 443,
-            state: "ESTABLISHED".into(),
+            state: "ESTABLISHED",
             pid: Some(1234),
             process_name: Some("curl".into()),
         };
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn listener_event_fields() {
         let ev = ListenerEvent {
-            protocol: "tcp6".into(),
+            protocol: "tcp6",
             addr: "::".into(),
             port: 22,
             pid: None,

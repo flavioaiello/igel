@@ -156,15 +156,19 @@ mod procnet {
         };
         let mut conns = Vec::new();
         for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 {
-                continue;
-            }
-            let (local_addr_hex, local_port_hex) = match fields[1].rsplit_once(':') {
+            let mut iter = line.split_whitespace();
+            let _sl = match iter.next() { Some(s) => s, None => continue };       // [0]
+            let local_field = match iter.next() { Some(s) => s, None => continue }; // [1]
+            let remote_field = match iter.next() { Some(s) => s, None => continue }; // [2]
+            let state_hex = match iter.next() { Some(s) => s, None => continue };   // [3]
+            // Skip fields [4]–[8] to reach [9] (inode)
+            let inode_str = match iter.nth(5) { Some(s) => s, None => continue };   // [9]
+
+            let (local_addr_hex, local_port_hex) = match local_field.rsplit_once(':') {
                 Some(pair) => pair,
                 None => continue,
             };
-            let (remote_addr_hex, remote_port_hex) = match fields[2].rsplit_once(':') {
+            let (remote_addr_hex, remote_port_hex) = match remote_field.rsplit_once(':') {
                 Some(pair) => pair,
                 None => continue,
             };
@@ -183,8 +187,8 @@ mod procnet {
                 local_port: parse_port(local_port_hex),
                 remote_addr,
                 remote_port: parse_port(remote_port_hex),
-                state: tcp_state(fields[3]),
-                inode: fields[9].parse().unwrap_or(0),
+                state: tcp_state(state_hex),
+                inode: inode_str.parse().unwrap_or(0),
             });
         }
         conns
@@ -209,12 +213,12 @@ pub fn collect_connections() -> Vec<ConnectionEvent> {
                 .map(|(p, n)| (Some(*p), Some(n.clone())))
                 .unwrap_or((None, None));
             events.push(ConnectionEvent {
-                protocol: protocol.to_string(),
+                protocol,
                 local_addr: conn.local_addr,
                 local_port: conn.local_port,
                 remote_addr: conn.remote_addr,
                 remote_port: conn.remote_port,
-                state: conn.state.to_string(),
+                state: conn.state,
                 pid,
                 process_name,
             });
@@ -255,7 +259,7 @@ pub fn collect_listeners() -> Vec<ListenerEvent> {
                 .map(|(p, n)| (Some(*p), Some(n.clone())))
                 .unwrap_or((None, None));
             events.push(ListenerEvent {
-                protocol: protocol.to_string(),
+                protocol,
                 addr: conn.local_addr,
                 port: conn.local_port,
                 pid,
@@ -393,8 +397,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         if let Ok(m) = fs::metadata("/etc/shadow").await {
             let mode = m.permissions().mode();
             out.push(BaselineEvent {
-                check: "shadow-perms".into(),
-                category: "auth".into(),
+                check: "shadow-perms",
+                category: "auth",
                 pass: mode & 0o077 == 0,
                 detail: format!("{:o}", mode),
                 severity: "high",
@@ -405,8 +409,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         if let Ok(m) = fs::metadata("/etc/passwd").await {
             let mode = m.permissions().mode();
             out.push(BaselineEvent {
-                check: "passwd-perms".into(),
-                category: "auth".into(),
+                check: "passwd-perms",
+                category: "auth",
                 pass: mode & 0o022 == 0,
                 detail: format!("{:o}", mode),
                 severity: "high",
@@ -424,8 +428,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
                 }
             });
             out.push(BaselineEvent {
-                check: "password-max-age".into(),
-                category: "auth".into(),
+                check: "password-max-age",
+                category: "auth",
                 pass: max_days.map_or(false, |d| d <= 90),
                 detail: max_days.map_or("not set".into(), |d| format!("{} days", d)),
                 severity: "medium",
@@ -440,8 +444,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
                 .lines()
                 .any(|l| l.trim().eq_ignore_ascii_case("PermitRootLogin no"));
             out.push(BaselineEvent {
-                check: "ssh-no-root".into(),
-                category: "auth".into(),
+                check: "ssh-no-root",
+                category: "auth",
                 pass: no_root,
                 detail: "PermitRootLogin".into(),
                 severity: "critical",
@@ -457,8 +461,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
                 }
             });
             out.push(BaselineEvent {
-                check: "ssh-max-auth-tries".into(),
-                category: "auth".into(),
+                check: "ssh-max-auth-tries",
+                category: "auth",
                 pass: max_auth.map_or(false, |n| n <= 4),
                 detail: max_auth.map_or("not set".into(), |n| n.to_string()),
                 severity: "medium",
@@ -469,8 +473,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
                 .lines()
                 .any(|l| l.trim().eq_ignore_ascii_case("PermitEmptyPasswords no"));
             out.push(BaselineEvent {
-                check: "ssh-no-empty-passwords".into(),
-                category: "auth".into(),
+                check: "ssh-no-empty-passwords",
+                category: "auth",
                 pass: no_empty,
                 detail: "PermitEmptyPasswords".into(),
                 severity: "high",
@@ -482,8 +486,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         // CIS 3.1.1 – IP forwarding
         if let Ok(val) = fs::read_to_string("/proc/sys/net/ipv4/ip_forward").await {
             out.push(BaselineEvent {
-                check: "ip-forwarding-disabled".into(),
-                category: "network".into(),
+                check: "ip-forwarding-disabled",
+                category: "network",
                 pass: val.trim() == "0",
                 detail: val.trim().to_string(),
                 severity: "medium",
@@ -493,8 +497,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         // CIS 3.2.8 – TCP SYN cookies
         if let Ok(val) = fs::read_to_string("/proc/sys/net/ipv4/tcp_syncookies").await {
             out.push(BaselineEvent {
-                check: "syn-cookies-enabled".into(),
-                category: "network".into(),
+                check: "syn-cookies-enabled",
+                category: "network",
                 pass: val.trim() == "1",
                 detail: val.trim().to_string(),
                 severity: "medium",
@@ -506,8 +510,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
             fs::read_to_string("/proc/sys/net/ipv4/conf/all/accept_redirects").await
         {
             out.push(BaselineEvent {
-                check: "icmp-redirects-disabled".into(),
-                category: "network".into(),
+                check: "icmp-redirects-disabled",
+                category: "network",
                 pass: val.trim() == "0",
                 detail: val.trim().to_string(),
                 severity: "medium",
@@ -519,8 +523,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
             fs::read_to_string("/proc/sys/net/ipv4/conf/all/accept_source_route").await
         {
             out.push(BaselineEvent {
-                check: "source-route-disabled".into(),
-                category: "network".into(),
+                check: "source-route-disabled",
+                category: "network",
                 pass: val.trim() == "0",
                 detail: val.trim().to_string(),
                 severity: "medium",
@@ -532,8 +536,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         // CIS 1.5.3 – ASLR
         if let Ok(val) = fs::read_to_string("/proc/sys/kernel/randomize_va_space").await {
             out.push(BaselineEvent {
-                check: "aslr-enabled".into(),
-                category: "system".into(),
+                check: "aslr-enabled",
+                category: "system",
                 pass: val.trim() == "2",
                 detail: val.trim().to_string(),
                 severity: "high",
@@ -543,8 +547,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
         // CIS 1.5.1 – Core dumps restricted
         if let Ok(val) = fs::read_to_string("/proc/sys/fs/suid_dumpable").await {
             out.push(BaselineEvent {
-                check: "core-dumps-restricted".into(),
-                category: "system".into(),
+                check: "core-dumps-restricted",
+                category: "system",
                 pass: val.trim() == "0",
                 detail: format!("suid_dumpable={}", val.trim()),
                 severity: "medium",
@@ -565,8 +569,8 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
             }
         }
         out.push(BaselineEvent {
-            check: "no-world-writable-etc".into(),
-            category: "filesystem".into(),
+            check: "no-world-writable-etc",
+            category: "filesystem",
             pass: world_writable.is_empty(),
             detail: if world_writable.is_empty() {
                 "none".into()
@@ -584,15 +588,15 @@ pub async fn check_baseline() -> Vec<BaselineEvent> {
             {
                 let opts = line.split_whitespace().nth(3).unwrap_or("");
                 out.push(BaselineEvent {
-                    check: "tmp-noexec".into(),
-                    category: "filesystem".into(),
+                    check: "tmp-noexec",
+                    category: "filesystem",
                     pass: opts.contains("noexec"),
                     detail: opts.to_string(),
                     severity: "medium",
                 });
                 out.push(BaselineEvent {
-                    check: "tmp-nosuid".into(),
-                    category: "filesystem".into(),
+                    check: "tmp-nosuid",
+                    category: "filesystem",
                     pass: opts.contains("nosuid"),
                     detail: opts.to_string(),
                     severity: "medium",

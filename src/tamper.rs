@@ -2,9 +2,9 @@ use std::fs;
 use serde::Serialize;
 #[derive(Debug, Serialize)]
 pub struct TamperEvent {
-    pub category: String,
-    pub signal: String,
-    pub severity: String,
+    pub category: &'static str,
+    pub signal: &'static str,
+    pub severity: &'static str,
     pub detail: String,
 }
 
@@ -14,14 +14,17 @@ pub fn check_tampering(pids: &[u32]) -> Vec<TamperEvent> {
         if let Ok(st) = fs::read_to_string(format!("/proc/{}/status", pid)) {
             for ln in st.lines() {
                 if ln.starts_with("TracerPid:") {
-                    let pts: Vec<&str> = ln.split_whitespace().collect();
-                    if pts.len() == 2 && pts[1] != "0" {
-                        evs.push(TamperEvent {
-                            category: "process_injection".into(),
-                            signal: "active_ptrace".into(),
-                            severity: "critical".into(),
-                            detail: format!("PID {} traced by {}", pid, pts[1]),
-                        });
+                    let mut parts = ln.split_whitespace();
+                    let _key = parts.next();
+                    if let Some(val) = parts.next() {
+                        if val != "0" && parts.next().is_none() {
+                            evs.push(TamperEvent {
+                                category: "process_injection",
+                                signal: "active_ptrace",
+                                severity: "critical",
+                                detail: format!("PID {} traced by {}", pid, val),
+                            });
+                        }
                     }
                     break;
                 }
@@ -32,9 +35,9 @@ pub fn check_tampering(pids: &[u32]) -> Vec<TamperEvent> {
         if let Ok(v) = st.trim().parse::<u32>() {
             if v != 0 {
                 evs.push(TamperEvent {
-                    category: "kernel_tampering".into(),
-                    signal: "kernel_tainted".into(),
-                    severity: "high".into(),
+                    category: "kernel_tampering",
+                    signal: "kernel_tainted",
+                    severity: "high",
                     detail: format!("Taint: {}", v),
                 });
             }
@@ -42,18 +45,18 @@ pub fn check_tampering(pids: &[u32]) -> Vec<TamperEvent> {
     }
     if let Ok(st) = fs::read_to_string("/proc/mounts") {
         for ln in st.lines() {
-            let pts: Vec<&str> = ln.split_whitespace().collect();
-            if pts.len() > 3 {
-                let m = pts[1];
-                let o = pts[3];
-                if (m == "/" || m.starts_with("/usr") || m.starts_with("/bin")) && o.contains("rw,") {
-                    evs.push(TamperEvent {
-                        category: "fs_forcing".into(),
-                        signal: "unauthorized_rw".into(),
-                        severity: "critical".into(),
-                        detail: format!("Mount {} is rw", m),
-                    });
-                }
+            let mut parts = ln.split_whitespace();
+            let _dev = match parts.next() { Some(d) => d, None => continue };
+            let mount_point = match parts.next() { Some(m) => m, None => continue };
+            let _fs_type = parts.next();
+            let options = match parts.next() { Some(o) => o, None => continue };
+            if (mount_point == "/" || mount_point.starts_with("/usr") || mount_point.starts_with("/bin")) && options.contains("rw,") {
+                evs.push(TamperEvent {
+                    category: "fs_forcing",
+                    signal: "unauthorized_rw",
+                    severity: "critical",
+                    detail: format!("Mount {} is rw", mount_point),
+                });
             }
         }
     }
@@ -67,9 +70,9 @@ mod tests {
     #[test]
     fn tamper_event_serializes_correctly() {
         let ev = TamperEvent {
-            category: "process_injection".into(),
-            signal: "active_ptrace".into(),
-            severity: "critical".into(),
+            category: "process_injection",
+            signal: "active_ptrace",
+            severity: "critical",
             detail: "PID 100 traced by 200".into(),
         };
         let v = serde_json::to_value(&ev).expect("serialize");
@@ -88,9 +91,9 @@ mod tests {
         ];
         for (cat, sig, sev) in categories {
             let ev = TamperEvent {
-                category: cat.into(),
-                signal: sig.into(),
-                severity: sev.into(),
+                category: cat,
+                signal: sig,
+                severity: sev,
                 detail: "test".into(),
             };
             let v = serde_json::to_value(&ev).expect("serialize");
@@ -115,13 +118,13 @@ mod tests {
 
         let mut flagged = Vec::new();
         for ln in &mount_lines {
-            let pts: Vec<&str> = ln.split_whitespace().collect();
-            if pts.len() > 3 {
-                let m = pts[1];
-                let o = pts[3];
-                if (m == "/" || m.starts_with("/usr") || m.starts_with("/bin")) && o.contains("rw,") {
-                    flagged.push(m.to_string());
-                }
+            let mut parts = ln.split_whitespace();
+            let _dev = match parts.next() { Some(d) => d, None => continue };
+            let mount_point = match parts.next() { Some(m) => m, None => continue };
+            let _fs_type = parts.next();
+            let options = match parts.next() { Some(o) => o, None => continue };
+            if (mount_point == "/" || mount_point.starts_with("/usr") || mount_point.starts_with("/bin")) && options.contains("rw,") {
+                flagged.push(mount_point.to_string());
             }
         }
 
@@ -147,10 +150,13 @@ Uid:\t0\t0\t0\t0";
         let mut tracer_found = false;
         for ln in status_content.lines() {
             if ln.starts_with("TracerPid:") {
-                let pts: Vec<&str> = ln.split_whitespace().collect();
-                if pts.len() == 2 && pts[1] != "0" {
-                    tracer_found = true;
-                    assert_eq!(pts[1], "5678");
+                let mut parts = ln.split_whitespace();
+                let _key = parts.next();
+                if let Some(val) = parts.next() {
+                    if val != "0" && parts.next().is_none() {
+                        tracer_found = true;
+                        assert_eq!(val, "5678");
+                    }
                 }
                 break;
             }
@@ -166,9 +172,12 @@ Uid:\t0\t0\t0\t0";
         let mut flagged = false;
         for ln in status_content.lines() {
             if ln.starts_with("TracerPid:") {
-                let pts: Vec<&str> = ln.split_whitespace().collect();
-                if pts.len() == 2 && pts[1] != "0" {
-                    flagged = true;
+                let mut parts = ln.split_whitespace();
+                let _key = parts.next();
+                if let Some(val) = parts.next() {
+                    if val != "0" && parts.next().is_none() {
+                        flagged = true;
+                    }
                 }
                 break;
             }
