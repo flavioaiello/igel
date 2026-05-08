@@ -28,6 +28,15 @@ impl Sink for StdoutSink {
 use tracing::{debug, error};
 
 #[cfg(feature = "http")]
+const HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "http")]
+const MAX_BUFFER_EVENT_BYTES: usize = 64 * 1024;
+#[cfg(feature = "http")]
+const MAX_BUFFER_FILE_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(feature = "http")]
+const MAX_DRAIN_LINES: usize = 4096;
+
+#[cfg(feature = "http")]
 pub struct HttpSink {
     client: reqwest::Client,
     url: String,
@@ -35,6 +44,7 @@ pub struct HttpSink {
     auth_header: Option<String>,
     buffer_path: Option<String>,
     inflight: std::sync::Arc<tokio::sync::Semaphore>,
+    buffer_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 #[cfg(feature = "http")]
@@ -43,33 +53,201 @@ const MAX_HTTP_INFLIGHT: usize = 16;
 
 #[cfg(feature = "http")]
 impl HttpSink {
-    pub fn new(url: String, auth_token: Option<String>, buffer_path: Option<String>) -> Self {
+    pub fn new(
+        url: String,
+        auth_token: Option<String>,
+        buffer_path: Option<String>,
+    ) -> anyhow::Result<Self> {
         let auth_header = auth_token.map(|t| format!("Bearer {}", t));
-        Self {
-            client: reqwest::Client::new(),
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .build()?;
+        Ok(Self {
+            client,
             url,
             auth_header,
             buffer_path,
             inflight: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_HTTP_INFLIGHT)),
+            buffer_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        })
+    }
+}
+
+#[cfg(feature = "http")]
+fn open_buffer_file_for_append(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true).read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[cfg(feature = "http")]
+fn sync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
 }
 
 /// Append a failed event to the on-disk buffer for later retry.
 #[cfg(feature = "http")]
-fn buffer_event(path: &str, json: &[u8]) {
+fn buffer_event(path: &str, json: &[u8]) -> bool {
     use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        Ok(mut f) => {
-            let _ = f.write_all(json);
-            let _ = f.write_all(b"\n");
-        }
-        Err(e) => error!("buffer write: {}", e),
+
+    if json.len() > MAX_BUFFER_EVENT_BYTES {
+        error!(
+            size = json.len(),
+            cap = MAX_BUFFER_EVENT_BYTES,
+            "buffered event exceeds configured size cap"
+        );
+        return false;
     }
+
+    let mut f = match open_buffer_file_for_append(path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!(path, err = %e, "buffer open failed");
+            return false;
+        }
+    };
+    let existing = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(e) => {
+            error!(path, err = %e, "buffer metadata failed");
+            return false;
+        }
+    };
+    let new_size = existing.saturating_add(json.len() as u64 + 1);
+    if new_size > MAX_BUFFER_FILE_BYTES {
+        error!(
+            path = path,
+            size = new_size,
+            cap = MAX_BUFFER_FILE_BYTES,
+            "buffer file size cap reached; dropping buffered event"
+        );
+        return false;
+    }
+
+    if let Err(e) = f.write_all(json).and_then(|_| f.write_all(b"\n")) {
+        error!(path, err = %e, "buffer write failed");
+        return false;
+    }
+    if let Err(e) = f.sync_data() {
+        error!(path, err = %e, "buffer sync failed");
+        return false;
+    }
+    sync_parent_dir(std::path::Path::new(path));
+    true
+}
+
+#[cfg(feature = "http")]
+fn queue_buffer_event(
+    path: String,
+    json: Vec<u8>,
+    buffer_lock: std::sync::Arc<std::sync::Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = match buffer_lock.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!(err = %e, "buffer lock poisoned");
+                    return false;
+                }
+            };
+            buffer_event(&path, &json)
+        })
+        .await;
+    });
+}
+
+#[cfg(feature = "http")]
+fn partition_buffer_content(content: &str) -> (Vec<&str>, String) {
+    let mut deliver = Vec::with_capacity(MAX_DRAIN_LINES.min(128));
+    let mut remaining = String::new();
+    for line in content.lines().filter(|line| !line.is_empty()) {
+        if deliver.len() < MAX_DRAIN_LINES {
+            deliver.push(line);
+        } else {
+            if !remaining.is_empty() {
+                remaining.push('\n');
+            }
+            remaining.push_str(line);
+        }
+    }
+    if !remaining.is_empty() {
+        remaining.push('\n');
+    }
+    (deliver, remaining)
+}
+
+#[cfg(feature = "http")]
+fn buffer_temp_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut file_name = path.file_name()?.to_os_string();
+    file_name.push(".tmp");
+    Some(path.with_file_name(file_name))
+}
+
+#[cfg(feature = "http")]
+fn rewrite_buffer_durable_blocking(path: &str, remaining: &str) -> bool {
+    use std::io::Write;
+
+    let path = std::path::Path::new(path);
+    if std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        error!(path = %path.display(), "refusing to rewrite symlink buffer path");
+        return false;
+    }
+    let tmp_path = match buffer_temp_path(path) {
+        Some(path) => path,
+        None => {
+            error!(path = %path.display(), "invalid buffer path");
+            return false;
+        }
+    };
+    let _ = std::fs::remove_file(&tmp_path);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+
+    let mut tmp = match options.open(&tmp_path) {
+        Ok(file) => file,
+        Err(e) => {
+            error!(path = %tmp_path.display(), err = %e, "failed to create buffer temp file");
+            return false;
+        }
+    };
+    if let Err(e) = tmp
+        .write_all(remaining.as_bytes())
+        .and_then(|_| tmp.sync_all())
+    {
+        error!(path = %tmp_path.display(), err = %e, "failed to write buffer temp file");
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    drop(tmp);
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        error!(path = %path.display(), err = %e, "failed to replace buffer file");
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
+    }
+    sync_parent_dir(path);
+    true
 }
 
 #[cfg(feature = "http")]
@@ -79,8 +257,8 @@ impl Sink for HttpSink {
             Ok(p) => p,
             Err(_) => {
                 tracing::warn!("http sink: at capacity, buffering event");
-                if let Some(ref path) = self.buffer_path {
-                    buffer_event(path, &json);
+                if let Some(path) = self.buffer_path.clone() {
+                    queue_buffer_event(path, json, self.buffer_lock.clone());
                 }
                 return;
             }
@@ -90,12 +268,11 @@ impl Sink for HttpSink {
         let client = self.client.clone();
         let auth_header = self.auth_header.clone();
         let buffer_path = self.buffer_path.clone();
+        let buffer_lock = self.buffer_lock.clone();
 
         tokio::spawn(async move {
             let _permit = permit;
-            let mut req = client
-                .post(&url)
-                .header("content-type", "application/json");
+            let mut req = client.post(&url).header("content-type", "application/json");
 
             if let Some(ref header_val) = auth_header {
                 req = req.header("authorization", header_val.as_str());
@@ -107,14 +284,14 @@ impl Sink for HttpSink {
                 }
                 Ok(resp) => {
                     error!(status = resp.status().as_u16(), "http sink non-2xx");
-                    if let Some(ref path) = buffer_path {
-                        buffer_event(path, &json);
+                    if let Some(path) = buffer_path {
+                        queue_buffer_event(path, json, buffer_lock);
                     }
                 }
                 Err(e) => {
                     error!(err = %e, "http sink");
-                    if let Some(ref path) = buffer_path {
-                        buffer_event(path, &json);
+                    if let Some(path) = buffer_path {
+                        queue_buffer_event(path, json, buffer_lock);
                     }
                 }
             }
@@ -126,20 +303,56 @@ impl Sink for HttpSink {
 /// Returns the number of events successfully delivered.
 /// Stops on first failure to preserve ordering and avoid data loss.
 #[cfg(feature = "http")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn drain_buffer(url: &str, auth_token: Option<&str>, buffer_path: &str) -> usize {
+    let size = match tokio::fs::metadata(buffer_path).await {
+        Ok(meta) => meta.len(),
+        Err(_) => return 0,
+    };
+    if size == 0 {
+        return 0;
+    }
+    if size > MAX_BUFFER_FILE_BYTES {
+        error!(
+            path = buffer_path,
+            size,
+            cap = MAX_BUFFER_FILE_BYTES,
+            "refusing to drain oversized buffer file"
+        );
+        return 0;
+    }
+
     let content = match tokio::fs::read_to_string(buffer_path).await {
         Ok(c) if !c.is_empty() => c,
         _ => return 0,
     };
 
-    let client = reqwest::Client::new();
-    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+    let client = match reqwest::Client::builder()
+        .timeout(HTTP_REQUEST_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            error!(err = %e, "failed to build client for drain");
+            return 0;
+        }
+    };
+    let (lines, remaining) = partition_buffer_content(&content);
     let total = lines.len();
+    if total == 0 {
+        return 0;
+    }
 
     for line in &lines {
-        let mut req = client
-            .post(url)
-            .header("content-type", "application/json");
+        if line.len() > MAX_BUFFER_EVENT_BYTES {
+            error!(
+                size = line.len(),
+                cap = MAX_BUFFER_EVENT_BYTES,
+                "refusing to drain oversized buffered line"
+            );
+            return 0;
+        }
+        let mut req = client.post(url).header("content-type", "application/json");
         if let Some(token) = auth_token {
             req = req.header("authorization", format!("Bearer {}", token));
         }
@@ -149,9 +362,15 @@ pub async fn drain_buffer(url: &str, auth_token: Option<&str>, buffer_path: &str
         }
     }
 
-    // All events delivered; truncate buffer
-    let _ = tokio::fs::write(buffer_path, b"").await;
-    total
+    match tokio::task::spawn_blocking({
+        let buffer_path = buffer_path.to_string();
+        move || rewrite_buffer_durable_blocking(&buffer_path, &remaining)
+    })
+    .await
+    {
+        Ok(true) => total,
+        _ => 0,
+    }
 }
 
 // ── MQTT sink ──
@@ -171,11 +390,7 @@ pub struct MqttSink {
 #[cfg(feature = "mqtt")]
 impl MqttSink {
     pub fn new(host: String, device_id: String, sas_token: Option<String>) -> anyhow::Result<Self> {
-        let mut mqttoptions = rumqttc::MqttOptions::new(
-            &device_id,
-            host.as_str(),
-            8883,
-        );
+        let mut mqttoptions = rumqttc::MqttOptions::new(&device_id, host.as_str(), 8883);
         mqttoptions.set_keep_alive(std::time::Duration::from_secs(30));
 
         if let Some(token) = sas_token {
@@ -241,7 +456,10 @@ impl Sink for MqttSink {
 
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = client.publish(topic, rumqttc::QoS::AtLeastOnce, false, json).await {
+            if let Err(e) = client
+                .publish(topic, rumqttc::QoS::AtLeastOnce, false, json)
+                .await
+            {
                 tracing::error!("Failed to publish MQTT message: {:?}", e);
             }
         });
@@ -287,11 +505,8 @@ mod tests {
 
         #[test]
         fn http_sink_constructs_without_auth() {
-            let sink = HttpSink::new(
-                "https://example.com/ingest".into(),
-                None,
-                None,
-            );
+            let sink =
+                HttpSink::new("https://example.com/ingest".into(), None, None).expect("http sink");
             assert_eq!(sink.url, "https://example.com/ingest");
             assert!(sink.auth_header.is_none());
             assert!(sink.buffer_path.is_none());
@@ -303,7 +518,8 @@ mod tests {
                 "https://example.com/v1".into(),
                 Some("token-123".into()),
                 Some("/tmp/buf.ndjson".into()),
-            );
+            )
+            .expect("http sink");
             assert_eq!(sink.url, "https://example.com/v1");
             assert_eq!(sink.auth_header.as_deref(), Some("Bearer token-123"));
             assert_eq!(sink.buffer_path.as_deref(), Some("/tmp/buf.ndjson"));
@@ -329,6 +545,40 @@ mod tests {
             std::fs::remove_file(&path).ok();
         }
 
+        #[test]
+        fn partition_buffer_content_preserves_undelivered_lines() {
+            let mut content = String::new();
+            for i in 0..(MAX_DRAIN_LINES + 2) {
+                content.push_str(&format!(r#"{{"line":{}}}"#, i));
+                content.push('\n');
+            }
+
+            let (deliver, remaining) = partition_buffer_content(&content);
+
+            assert_eq!(deliver.len(), MAX_DRAIN_LINES);
+            assert!(remaining.contains(&format!(r#"{{"line":{}}}"#, MAX_DRAIN_LINES)));
+            assert!(remaining.contains(&format!(r#"{{"line":{}}}"#, MAX_DRAIN_LINES + 1)));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn buffer_event_rejects_symlink_path() {
+            let target = std::env::temp_dir().join("igel_test_buffer_target.ndjson");
+            let link = std::env::temp_dir().join("igel_test_buffer_link.ndjson");
+            std::fs::write(&target, b"").expect("write target");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+            let written = buffer_event(link.to_str().expect("path"), br#"{"line":1}"#);
+            let target_content = std::fs::read_to_string(&target).expect("read target");
+
+            assert!(!written);
+            assert!(target_content.is_empty());
+
+            std::fs::remove_file(&link).ok();
+            std::fs::remove_file(&target).ok();
+        }
+
         #[tokio::test]
         async fn drain_buffer_empty_file_returns_zero() {
             let path = std::env::temp_dir().join("igel_test_drain_empty.ndjson");
@@ -338,7 +588,8 @@ mod tests {
                 "https://example.com/ingest",
                 None,
                 path.to_str().expect("path"),
-            ).await;
+            )
+            .await;
             assert_eq!(count, 0);
 
             tokio::fs::remove_file(&path).await.ok();
@@ -350,7 +601,8 @@ mod tests {
                 "https://example.com/ingest",
                 None,
                 "/tmp/igel_nonexistent_drain_837241.ndjson",
-            ).await;
+            )
+            .await;
             assert_eq!(count, 0);
         }
     }

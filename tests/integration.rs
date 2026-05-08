@@ -149,10 +149,7 @@ async fn fim_detects_file_creation_and_modification() {
             .expect("watch path");
 
         while let Ok(event) = notify_rx.recv_async().await {
-            let is_relevant = matches!(
-                event.kind,
-                EventKind::Modify(_) | EventKind::Create(_)
-            );
+            let is_relevant = matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_));
             if !is_relevant {
                 continue;
             }
@@ -161,9 +158,7 @@ async fn fim_detects_file_creation_and_modification() {
                     let mut h = Sha256::new();
                     h.update(&contents);
                     let hash = format!("{:x}", h.finalize());
-                    let _ = tx
-                        .send((path.to_string_lossy().to_string(), hash))
-                        .await;
+                    let _ = tx.send((path.to_string_lossy().to_string(), hash)).await;
                 }
             }
         }
@@ -184,18 +179,17 @@ async fn fim_detects_file_creation_and_modification() {
     // because the watcher may emit multiple events for a single logical write.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut last_hash = None;
-    loop {
-        match timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), rx.recv()).await {
-            Ok(Some((_path, hash))) => {
-                last_hash = Some(hash);
-                // Drain any additional rapid events within a short window
-                sleep(Duration::from_millis(100)).await;
-                while let Ok((_p, h)) = rx.try_recv() {
-                    last_hash = Some(h);
-                }
-                break;
-            }
-            _ => break,
+    if let Ok(Some((_path, hash))) = timeout(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+        rx.recv(),
+    )
+    .await
+    {
+        last_hash = Some(hash);
+        // Drain any additional rapid events within a short window
+        sleep(Duration::from_millis(100)).await;
+        while let Ok((_p, h)) = rx.try_recv() {
+            last_hash = Some(h);
         }
     }
 
@@ -229,12 +223,34 @@ fn all_event_kinds_have_required_envelope_fields() {
 
     let required_keys = ["ts", "device", "kind", "v"];
     let kinds = [
-        ("processes", serde_json::json!({"pid": 1, "name": "test", "cmd": "", "user": "", "cpu": 0.0, "mem_bytes": 0})),
-        ("network", serde_json::json!({"iface": "lo", "tx_bytes": 0, "rx_bytes": 0})),
-        ("heartbeat", serde_json::json!({"os": "Linux", "os_version": "5.15", "uptime_secs": 0, "cpu": 0.0, "mem_pct": 0.0, "events_sent": 0})),
-        ("fim", serde_json::json!({"path": "/etc/passwd", "sha256": "abc", "change": "modified", "size": 100})),
-        ("baseline", serde_json::json!({"check": "test", "category": "auth", "pass": true, "detail": "ok", "severity": "high"})),
-        ("tamper", serde_json::json!({"category": "process_injection", "signal": "active_ptrace", "severity": "critical", "detail": "test"})),
+        (
+            "processes",
+            serde_json::json!({"pid": 1, "name": "test", "cmd": "", "user": "", "cpu": 0.0, "mem_bytes": 0}),
+        ),
+        (
+            "network",
+            serde_json::json!({"iface": "lo", "tx_bytes": 0, "rx_bytes": 0}),
+        ),
+        (
+            "heartbeat",
+            serde_json::json!({"os": "Linux", "os_version": "5.15", "uptime_secs": 0, "cpu": 0.0, "mem_pct": 0.0, "events_sent": 0}),
+        ),
+        (
+            "fim",
+            serde_json::json!({"path": "/etc/passwd", "sha256": "abc", "change": "modified", "size": 100}),
+        ),
+        (
+            "baseline",
+            serde_json::json!({"check": "test", "category": "auth", "pass": true, "detail": "ok", "severity": "high"}),
+        ),
+        (
+            "tamper",
+            serde_json::json!({"category": "process_injection", "signal": "active_ptrace", "severity": "critical", "detail": "test"}),
+        ),
+        (
+            "kernel_integrity",
+            serde_json::json!({"secure_boot": true, "lockdown": "integrity", "modules_disabled": true, "kexec_disabled": true, "unprivileged_bpf_disabled": true, "tainted": 0, "module_count": 42}),
+        ),
     ];
 
     for (kind, payload) in &kinds {
@@ -298,7 +314,10 @@ fn sha256_different_input_different_hash() {
     h2.update(b"content B");
     let hash2 = format!("{:x}", h2.finalize());
 
-    assert_ne!(hash1, hash2, "different inputs must produce different hashes");
+    assert_ne!(
+        hash1, hash2,
+        "different inputs must produce different hashes"
+    );
 }
 
 // ── Binary output format ─────────────────────────────────────────────

@@ -11,11 +11,21 @@ Most security agents are built for servers and desktops — they assume gigabyte
 
 **Security sensor that secures itself.** Igel disables its own core dumps, restricts ptrace attachment, and applies an irrevocable Landlock filesystem sandbox — all before emitting a single event. If the device is compromised, the sensor is hardened against inspection and tampering.
 
+**Userland Reliability & Kernel Reality.** Igel operates in userland (Ring 3). Internally, it is built to the highest possible security standards: zero unbounded allocations, strict zero-trust data ingestion, and rust-enforced memory safety ensure Igel itself cannot be compromised or used as an infection vector. However, because it relies on the kernel for truth, it cannot natively intercept Ring 0 rootkits. Instead, Igel focuses ruthlessly on File Integrity, anomaly detection, and configuration drift to catch the inevitable indicators of compromise (IoCs) surrounding a breach.
+
 **Pipe-native, vendor-neutral.** Every event is one line of NDJSON on stdout. Pipe it to Fluent Bit, Vector, Logstash, a cloud API, or a plain file. Switch SIEMs without touching the sensor. Optional HTTP and MQTT sinks are available when stdout isn't enough.
 
-**Push-based file integrity.** FIM uses inotify/kqueue — changes are detected the instant they happen, not on the next polling cycle. No wasted CPU spinning over unchanged files.
+**Realistic Threat Detection.** Igel focuses on detecting the highest-impact threats for IoT devices:
+- **Persistence & Implants:** Identifies rogue binaries and modifications to core files.
+- **Post-Exploitation & Anomalies:** Flags unexpected script interpreters, resource hijacking (like cryptominers), and process injection.
+- **Network Exfiltration:** Detects rogue listening services (bind shells) and anomaly outbound connections.
+- **Defense Evasion & Drift:** Alerts on degraded firewalls, loosened SSH hardening, missing heartbeats, and unauthorized RW filesystem mounts.
 
-**CIS baselines and tamper detection included.** Fifteen CIS-aligned checks (SSH hardening, ASLR, mount options, kernel parameters) and active tamper signals (ptrace injection, kernel taint, unauthorized read-write mounts) ship out of the box. No plugins, no policy downloads.
+**Smart, stateful event filtering.** Igel doesn't flood your SIEM with repetitive process trees or idle listeners. It employs a stateful delta engine (surviving sensor reboots via JSON state file) to emit connections and listeners *only* when new signatures appear. Processes are behaviorally filtered, recording execution only if they exhibit anomalies (like `/tmp/` execution, `memfd`, `netcat`, or reverse shell hints).
+
+**Push-based file integrity.** FIM uses inotify/kqueue, secured with robust anti-TOCTOU design: it verifies path identity, file type, and rejects symlinks and hardlinks *before, during, and after* streaming hashes.
+
+**CIS baselines, kernel integrity & tamper detection.** Fifteen CIS-aligned checks, comprehensive runtime kernel security state evaluation (Secure Boot, BPF, Kexec logic), and active tamper signals (ptrace injection, kernel taint) ship out of the box—reporting efficiently on state degradation rather than pinging endlessly on successes.
 
 **Built for the long tail.** Single-threaded async runtime, bounded allocations, zero-copy serialization where possible. Igel is designed to run for months on a device with 64 MB of RAM without drifting upward.
 
@@ -28,17 +38,20 @@ Most security agents are built for servers and desktops — they assume gigabyte
 | `connections` | Active TCP/UDP connections with PID resolution (Linux) |
 | `listeners` | Listening network sockets with PID resolution (Linux) |
 | `fim` | File integrity monitoring — push-based via inotify/kqueue (SHA-256 change detection) |
-| `baseline` | CIS-style security baseline checks (15 checks, Linux) |
+| `baseline` | CIS-style security baseline checks (15 checks, Linux) — *Stateful: emits only on failures* |
+| `kernel_integrity` | Kernel security state (Secure Boot, lockdown, module signature enforcement, BPF/kexec status, taint) — *Stateful: emits on drift/degradation* |
 | `tamper` | Tamper detection: ptrace injection, kernel taint, unauthorized RW mounts (Linux) |
 | `heartbeat` | System vitals + uptime + event counter |
 
 Every event is wrapped in a uniform `Envelope` with `ts`, `device`, `kind`, and `v` (crate version string).
 
-### Self-protection
+### Self-protection & Active Protection
 
-On Linux, Igel hardens its own process at startup:
+On Linux, Igel hardens its own process and can optionally act as a kernel enforcer:
 
-- Disables core dumps via `PR_SET_DUMPABLE` to prevent memory inspection by a local adversary.
+- **Disable Core Dumps**: Uses `PR_SET_DUMPABLE` to prevent memory inspection by a local adversary.
+- **Landlock Sandbox**: Limits the sensor's own filesystem reach (read-only baseline paths, specific write-only buffer directory).
+- **Proactive Kernel Lockdown**: If `enforce_kernel_lockdown = true` is set, Igel drops the portcullis at startup by setting `modules_disabled=1`, `kexec_load_disabled=1`, and `unprivileged_bpf_disabled=1`, stopping kernel-level persistence dead in its tracks.
 
 ### Tamper detection
 
@@ -107,7 +120,11 @@ network_interval   = 30    # default: 30
 connection_interval = 60   # default: 60
 listener_interval  = 300   # default: 300
 baseline_interval  = 3600  # default: 3600
+kernel_interval    = 300   # default: 300
 heartbeat_interval = 60    # default: 60
+
+# If true, proactively locks down the kernel at startup (e.g. disables new modules/kexec).
+enforce_kernel_lockdown = false
 
 # FIM is push-based (inotify/kqueue) — no polling interval needed.
 fim_paths = [
@@ -220,6 +237,7 @@ Ready-to-deploy **Microsoft Sentinel analytic rules** (KQL) for every detection 
 | Account Manipulation | T1098 | Changes to `/etc/passwd` or `/etc/shadow` trigger immediate FIM events with before/after hashes |
 | Hijack Execution Flow | T1574 | Modifications to shared libraries or `LD_PRELOAD` config files are caught in real time |
 | Boot or Logon Autostart Execution | T1547 | FIM on `/etc/rc.local`, systemd unit directories, or init scripts detects persistence implants |
+| Kernel Modules and Extensions | T1547.006 | `kernel_integrity` events detect loaded module drift and signed-module enforcement failure |
 
 ### Baseline checks → Defense Evasion & Credential Access
 

@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-security-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,arm-unknown-linux-musleabi
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test default features
+        run: cargo test --all-features
+
+      - name: Test stdout-only build
+        run: cargo test --no-default-features
+
+      - name: Check Linux GNU release
+        run: cargo check --release --all-features
+
+      - name: Check x86_64 musl stdout-only release
+        run: cargo check --release --no-default-features --target x86_64-unknown-linux-musl
+
+      - name: Check ARM musl stdout-only release
+        run: cargo check --release --no-default-features --target arm-unknown-linux-musleabi

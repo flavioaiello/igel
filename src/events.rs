@@ -101,6 +101,19 @@ pub struct ListenerEvent {
     pub process_name: Option<String>,
 }
 
+// ── Kernel integrity events ──────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct KernelEvent {
+    pub secure_boot: bool,
+    pub lockdown: String,
+    pub modules_disabled: bool,
+    pub kexec_disabled: bool,
+    pub unprivileged_bpf_disabled: bool,
+    pub tainted: u32,
+    pub module_count: usize,
+}
+
 // ── Heartbeat ────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -149,7 +162,10 @@ mod tests {
         let json = serde_json::to_value(&env).expect("serialize");
 
         // Flattened: payload fields live at root, not under a "data" key
-        assert!(json.get("data").is_none(), "data key must not exist (flattened)");
+        assert!(
+            json.get("data").is_none(),
+            "data key must not exist (flattened)"
+        );
         assert_eq!(json["iface"], "eth0");
         assert_eq!(json["tx_bytes"], 100);
         assert_eq!(json["rx_bytes"], 200);
@@ -169,7 +185,10 @@ mod tests {
         let line = serde_json::to_string(&env).expect("serialize");
 
         // Must be a single line (NDJSON requirement)
-        assert!(!line.contains('\n'), "NDJSON line must not contain newlines");
+        assert!(
+            !line.contains('\n'),
+            "NDJSON line must not contain newlines"
+        );
 
         // Must parse back as valid JSON
         let parsed: Value = serde_json::from_str(&line).expect("parse");

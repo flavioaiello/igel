@@ -30,6 +30,11 @@ pub fn harden_process() {}
 
 // ── Phase 2: Landlock filesystem sandbox ─────────────────────────────────────
 
+#[cfg(all(target_os = "linux", feature = "landlock"))]
+const MAX_LANDLOCK_EXTRA_READ_PATHS: usize = 256;
+#[cfg(all(target_os = "linux", feature = "landlock"))]
+const MAX_LANDLOCK_WRITE_PATHS: usize = 16;
+
 /// Apply an irrevocable Landlock filesystem sandbox.
 ///
 /// * Read-only access is granted to `/proc`, `/sys`, `/etc`, `/dev/urandom`
@@ -46,8 +51,8 @@ pub fn harden_process() {}
 #[cfg(all(target_os = "linux", feature = "landlock"))]
 pub fn sandbox_filesystem(extra_read_paths: &[String], write_paths: &[String]) {
     use landlock::{
-        path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr,
-        RulesetCreatedAttr, RulesetStatus, ABI,
+        path_beneath_rules, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr,
+        RulesetStatus, ABI,
     };
 
     // Request the newest ABI; BestEffort (default) transparently falls back
@@ -61,7 +66,11 @@ pub fn sandbox_filesystem(extra_read_paths: &[String], write_paths: &[String]) {
         "/etc",         // baseline checks (shadow, passwd, sshd_config …)
         "/dev/urandom", // entropy for TLS handshakes
     ];
-    let extra_refs: Vec<&str> = extra_read_paths.iter().map(|s| s.as_str()).collect();
+    let mut extra_refs =
+        Vec::with_capacity(extra_read_paths.len().min(MAX_LANDLOCK_EXTRA_READ_PATHS));
+    for path in extra_read_paths.iter().take(MAX_LANDLOCK_EXTRA_READ_PATHS) {
+        extra_refs.push(path.as_str());
+    }
     read_paths.extend(&extra_refs);
 
     // Step 1 — declare handled access types (everything not in a rule is denied)
@@ -84,10 +93,8 @@ pub fn sandbox_filesystem(extra_read_paths: &[String], write_paths: &[String]) {
     };
 
     // Step 2 — read-only rules for monitoring paths
-    let created = match created.add_rules(path_beneath_rules(
-        read_paths,
-        AccessFs::from_read(abi),
-    )) {
+    let created = match created.add_rules(path_beneath_rules(read_paths, AccessFs::from_read(abi)))
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("landlock: failed adding read rules: {e}");
@@ -99,7 +106,10 @@ pub fn sandbox_filesystem(extra_read_paths: &[String], write_paths: &[String]) {
     let created = if write_paths.is_empty() {
         created
     } else {
-        let wp_refs: Vec<&str> = write_paths.iter().map(|s| s.as_str()).collect();
+        let mut wp_refs = Vec::with_capacity(write_paths.len().min(MAX_LANDLOCK_WRITE_PATHS));
+        for path in write_paths.iter().take(MAX_LANDLOCK_WRITE_PATHS) {
+            wp_refs.push(path.as_str());
+        }
         match created.add_rules(path_beneath_rules(wp_refs, AccessFs::from_all(abi))) {
             Ok(c) => c,
             Err(e) => {
@@ -116,14 +126,10 @@ pub fn sandbox_filesystem(extra_read_paths: &[String], write_paths: &[String]) {
                 tracing::info!("landlock: filesystem sandbox fully enforced");
             }
             RulesetStatus::PartiallyEnforced => {
-                tracing::info!(
-                    "landlock: filesystem sandbox partially enforced (kernel ABI < V5)"
-                );
+                tracing::info!("landlock: filesystem sandbox partially enforced (kernel ABI < V5)");
             }
             RulesetStatus::NotEnforced => {
-                tracing::warn!(
-                    "landlock: sandbox NOT enforced (kernel does not support Landlock)"
-                );
+                tracing::warn!("landlock: sandbox NOT enforced (kernel does not support Landlock)");
             }
         },
         Err(e) => {
